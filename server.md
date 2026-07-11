@@ -22,7 +22,14 @@ systemctl enable --now nfs-server
 systemctl status nfs-server
 ```
 
-### 4. Create the shared directories
+### 4. Create department groups and shared directories
+
+Create a dedicated group for each department and a corresponding shared directory:
+
+```bash
+groupadd warehouse
+groupadd accounting
+```
 
 ```bash
 mkdir -p /mnt/warehouse /mnt/accounting
@@ -30,13 +37,17 @@ mkdir -p /mnt/warehouse /mnt/accounting
 
 ### 5. Set permissions and ownership
 
-```bash
-chmod 755 /mnt/warehouse
-chmod 755 /mnt/accounting
+Assign each directory to its corresponding group and restrict access to group members only:
 
-chown nobody:nobody /mnt/warehouse
-chown nobody:nobody /mnt/accounting
+```bash
+chmod 770 /mnt/warehouse
+chmod 770 /mnt/accounting
+
+chown root:warehouse /mnt/warehouse
+chown root:accounting /mnt/accounting
 ```
+
+> **📌 Note:** Using `root` as the owner and the department group as the group owner is the recommended approach. This prevents any single user from having full ownership of a shared directory.
 
 ### 6. Configure the exports file
 
@@ -47,11 +58,13 @@ vim /etc/exports
 Add the following lines (replace the IP with your actual client IP):
 
 ```
-/mnt/warehouse  192.168.122.Y/24(rw,sync,root_squash,no_subtree_check)
-/mnt/accounting 192.168.122.Y/24(rw,sync,root_squash,no_subtree_check)
+/mnt/warehouse  192.168.122.Y/24(rw,sync,no_root_squash,no_subtree_check,acl)
+/mnt/accounting 192.168.122.Y/24(rw,sync,no_root_squash,no_subtree_check,acl)
 ```
 
-> **📌 Note on `root_squash`:** This option maps root requests from the client to the `nobody` user on the server, preventing a client with root access from compromising the server's files. This is the recommended setting for production environments.
+> **📌 Note on `no_root_squash`:** This option allows the client's root user to operate as root on the server. It is used here intentionally to enable `chown` and `setfacl` commands to work correctly over the NFS mount. In a production environment, this should be replaced with Kerberos-based authentication (NFSv4 + Kerberos), which handles user identity mapping securely without requiring `no_root_squash`.
+
+> **📌 Note on `acl`:** The `acl` export option enables ACL support over the NFS share. This is required for `setfacl` to work on the client side when using NFSv3.
 
 ### 7. Apply the exports
 
@@ -70,23 +83,23 @@ firewall-cmd --reload
 firewall-cmd --list-services
 ```
 
-### 9. Create an admin user and group
+### 9. Create an admin user
 
 ```bash
-groupadd developers
 useradd sysadmin
 passwd sysadmin
-usermod -aG developers sysadmin
 usermod -aG wheel sysadmin
 ```
 
 ### 10. Disable root SSH login
 
+Rocky Linux may have a drop-in configuration file that overrides `sshd_config`. Check and edit it directly:
+
 ```bash
-vim /etc/ssh/sshd_config
+vim /etc/ssh/sshd.d/01-permitrootlogin.conf
 ```
 
-Find and set the following line:
+Set the following line:
 
 ```
 PermitRootLogin no
@@ -98,6 +111,6 @@ Then restart the SSH service:
 systemctl restart sshd
 ```
 
-> **⚠️ Important:** Before logging out, open a second terminal and confirm that the `sysadmin` user can log in via SSH. Locking yourself out is a classic mistake — don't be that person.
+> **⚠️ Important:** Before logging out, open a second terminal and confirm that the `sysadmin` user can connect via SSH. Locking yourself out of the server is a classic mistake — always verify access before closing the current session.
 
-> From this point on, all configuration must be done using the `sysadmin` user.
+> From this point on, all administration must be performed using the `sysadmin` user with sudo.
