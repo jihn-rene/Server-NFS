@@ -12,13 +12,13 @@ dnf update -y
 ### 2. Install required packages
 
 ```bash
-dnf install -y nfs-utils rsync vim
+dnf install -y nfs-utils rsync vim acl autofs
 ```
 
 ### 3. Create mount points
 
 The `/srv/nfs/` directory is the standard location for data served over the network.
-Regular users do not need to know about or access `/srv/nfs/` directly.
+Regular users do not need to know about or access `/srv/nfs/` directly — autofs handles mounting transparently.
 
 ```bash
 mkdir -p /srv/nfs/stock /srv/nfs/finance
@@ -26,7 +26,7 @@ mkdir -p /srv/nfs/stock /srv/nfs/finance
 
 ### 4. Test manual mount
 
-Before editing fstab, confirm the server is reachable and exporting correctly:
+Before configuring autofs, confirm the server is reachable and exporting correctly:
 
 ```bash
 showmount -e 192.168.122.X
@@ -39,50 +39,7 @@ Export list for 192.168.122.X:
 /mnt/warehouse  192.168.122.Y/24
 ```
 
-Then mount manually to verify:
-
-```bash
-mount -t nfs 192.168.122.X:/mnt/warehouse  /srv/nfs/stock
-mount -t nfs 192.168.122.X:/mnt/accounting /srv/nfs/finance
-
-df -h | grep srv
-```
-
-### 5. Configure automatic mount on boot
-
-```bash
-vim /etc/fstab
-```
-
-Add the following lines at the end of the file:
-
-```
-192.168.122.X:/mnt/warehouse  /srv/nfs/stock   nfs  vers=3,defaults,_netdev  0  0
-192.168.122.X:/mnt/accounting /srv/nfs/finance  nfs  vers=3,defaults,_netdev  0  0
-```
-
-> **📌 Note on `vers=3`:** NFSv4 does not support the `acl` export option in the same way as NFSv3. Forcing NFSv3 here ensures that `setfacl` works correctly on the client side over the NFS mount.
-
-> **📌 Note on `_netdev`:** This option tells the system to wait for the network to be available before attempting to mount NFS volumes. Without it, the system may fail to boot if the NFS server is unreachable.
-
-```bash
-systemctl daemon-reload
-mount -a
-df -h
-```
-
-### 6. Test write access
-
-```bash
-echo "Testing stock directory"   > /srv/nfs/stock/test.txt
-echo "Testing finance directory" > /srv/nfs/finance/test.txt
-
-# Verify on the server that the files were created:
-ls -la /mnt/warehouse/
-ls -la /mnt/accounting/
-```
-
-### 7. Create users and groups
+### 5. Create users and groups
 
 ```bash
 # Admin user
@@ -110,12 +67,10 @@ usermod -aG accounting ana
 usermod -aG warehouse  eli
 ```
 
-### 8. Disable root SSH login
-
-Rocky Linux may have a drop-in configuration file that overrides `sshd_config`. Check and edit it directly:
+### 6. Disable root SSH login
 
 ```bash
-vim /etc/ssh/sshd.d/01-permitrootlogin.conf
+vim /etc/ssh/sshd_config.d/01-permitrootlogin.conf
 ```
 
 Set the following line:
@@ -134,9 +89,128 @@ systemctl restart sshd
 
 > From this point on, all administration must be performed using the `administrator` user with sudo.
 
+### 7. Configure autofs for on-demand mounting
+
+Autofs mounts the NFS directories automatically when they are accessed and unmounts them after a period of inactivity. This is more efficient than static `/etc/fstab` entries.
+
+Enable and start the autofs service:
+
+```bash
+systemctl enable --now autofs
+systemctl status autofs
+```
+
+Edit the master autofs configuration file:
+
+```bash
+vim /etc/auto.master
+```
+
+Add the following line at the end of the file:
+
+```
+/srv/nfs   /etc/auto.share   --timeout=60
+```
+
+> **📌 Note:** `/srv/nfs` is the base directory. The `--timeout=60` option unmounts the share automatically after 60 seconds of inactivity.
+
+Create the map file that defines what to mount inside `/srv/nfs`:
+
+```bash
+vim /etc/auto.share
+```
+
+Add the following lines:
+
+```
+stock    -fstype=nfs,rw,noatime,vers=3   192.168.122.X:/mnt/warehouse
+finance  -fstype=nfs,rw,noatime,vers=3   192.168.122.X:/mnt/accounting
+```
+
+> **📌 Note on `vers=3`:** NFSv4 does not support the `acl` export option in the same way as NFSv3. Forcing NFSv3 here ensures that `setfacl` works correctly on the client side over the NFS mount. Without this option, `setfacl` returns "Operation not supported".
+
+Restart autofs to apply the changes:
+
+```bash
+systemctl restart autofs
+```
+
+Test the on-demand mount by accessing the directories:
+
+```bash
+ls /srv/nfs/stock
+ls /srv/nfs/finance
+
+# Confirm the mounts are active
+mount | grep nfs
+```
+
+### 8. Enable autofs logging
+
+Enable verbose logging in the autofs configuration:
+
+```bash
+vim /etc/sysconfig/autofs
+```
+
+Find and set the following line, if it does not exist, you creator:
+
+```
+LOGGING="verbose"
+```
+
+> **📌 Available log levels:** `none` (default, no logging), `verbose` (mount and unmount events), `debug` (full detail — use only for troubleshooting).
+
+Create a dedicated rsyslog rule to redirect autofs logs to a separate file:
+
+```bash
+vim /etc/rsyslog.d/autofs.conf
+```
+
+Add the following lines:
+
+```
+:programname, isequal, "automount" /var/log/autofs.log
+& stop
+```
+
+Restart both services to apply the changes:
+
+```bash
+systemctl restart autofs
+systemctl restart rsyslog
+```
+
+Monitor the log in real time:
+
+```bash
+tail -f /var/log/autofs.log
+```
+
+Expected log output when accessing a mount point:
+```
+automount[PID]: attempting to mount entry /srv/nfs/stock
+automount[PID]: mounted /srv/nfs/stock
+```
+
+After 60 seconds of inactivity:
+```
+automount[PID]: expiring path /srv/nfs/stock
+automount[PID]: umounting /srv/nfs/stock
+```
+
 ### 9. Set directory permissions and ownership on mount points
 
-Since `no_root_squash` is enabled on the server, `chown` operations from the client are allowed over the NFS mount:
+Since `no_root_squash` is enabled on the server, `chown` operations from the client are allowed over the NFS mount.
+
+Access the directories first to trigger autofs mounting:
+
+```bash
+ls /srv/nfs/stock
+ls /srv/nfs/finance
+```
+
+Then apply permissions:
 
 ```bash
 chmod 770 /srv/nfs/finance/
@@ -146,24 +220,37 @@ chown root:accounting /srv/nfs/finance/
 chown root:warehouse  /srv/nfs/stock/
 ```
 
-> **📌 Note:** After applying these permissions, `ana` (accounting group) cannot access `/srv/nfs/stock/`, and `eli` (warehouse group) cannot access `/srv/nfs/finance/`. This was tested and confirmed in the lab.
+> **📌 Note:** After applying these permissions, `ana` (accounting group) can only access `/srv/nfs/finance/`, and `eli` (warehouse group) can only access `/srv/nfs/stock/`. This was tested and confirmed in the lab.
 
 ### 10. Configure ACL for fine-grained access control
 
-ACL allows granting specific permissions to individual users beyond what standard group permissions allow.
-In this case, the `administrator` user is granted full access to both directories:
+ACL allows granting specific permissions to individual users beyond what standard group permissions provide.
+
+Grant the `administrator` user full access to both directories:
 
 ```bash
 setfacl -m u:administrator:rwx /srv/nfs/finance/
 setfacl -m u:administrator:rwx /srv/nfs/stock/
 ```
 
-Apply default ACL so that new files and directories created inside inherit the same rules:
+Grant department users access to their respective directories:
+
+```bash
+setfacl -m u:ana:rwx /srv/nfs/finance/
+setfacl -m u:eli:rwx /srv/nfs/stock/
+```
+
+Apply default ACL so that new files and subdirectories inherit the same rules:
 
 ```bash
 setfacl -d -m u:administrator:rwx /srv/nfs/finance/
 setfacl -d -m u:administrator:rwx /srv/nfs/stock/
+
+setfacl -d -m u:ana:rwx /srv/nfs/finance/
+setfacl -d -m u:eli:rwx /srv/nfs/stock/
 ```
+
+> **📌 Note on the `-d` flag:** Without `-d`, new files and subdirectories created inside the directory do not inherit the ACL rules. The `-d` flag sets a default ACL that is automatically applied to all new content.
 
 Verify the applied ACL:
 
@@ -186,13 +273,20 @@ chmod 700 /backup/nfs
 chown root:root /backup/nfs
 ```
 
-Schedule the backup with cron to run every day at 7:00 and 12:00:
+Create and configure the backup script (see [Scripts](scripts/script.md) for the full script):
+
+```bash
+vim /usr/local/bin/nfs_backup.sh
+chmod +x /usr/local/bin/nfs_backup.sh
+```
+
+Schedule the backup with cron to run every day at 07:00 and 12:00:
 
 ```bash
 vim /etc/crontab
 ```
 
-Add the following lines:
+Add the following line:
 
 ```
 0 7,12 * * * root /usr/local/bin/nfs_backup.sh
@@ -200,4 +294,4 @@ Add the following lines:
 
 > **📌 Note on the cron syntax:** `0 7,12 * * *` means "at minute 0 of hours 7 and 12, every day".
 
-> **📌 Why backup on the client?** The NFS server holds the primary copy of the data. The client backup in `/backup/nfs/` is an independent local copy. If the server fails or a file is accidentally deleted, the client still has a recent copy available — which is the entire purpose of this setup.
+> **📌 Why backup on the client?** The NFS server holds the primary copy of the data. The client backup in `/backup/nfs/` is a completely independent local copy. If the server fails or a file is accidentally deleted, the client still has a recent copy available — which is the entire purpose of this setup.

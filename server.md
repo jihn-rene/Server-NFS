@@ -93,10 +93,8 @@ usermod -aG wheel sysadmin
 
 ### 10. Disable root SSH login
 
-Rocky Linux may have a drop-in configuration file that overrides `sshd_config`. Check and edit it directly:
-
 ```bash
-vim /etc/ssh/sshd.d/01-permitrootlogin.conf
+vim /etc/ssh/sshd_config.d/01-permitrootlogin.conf
 ```
 
 Set the following line:
